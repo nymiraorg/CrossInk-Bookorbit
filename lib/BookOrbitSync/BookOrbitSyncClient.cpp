@@ -134,7 +134,9 @@ BookOrbitSyncClient::Error validateAuthResponse(const char* body) {
     return BookOrbitSyncClient::INVALID_AUTH_RESPONSE;
   }
 
-  const char* authorized = doc["authorized"] | nullptr;
+  // .as<const char*>() — NOT `| nullptr` (see BookOrbitRequestClient): the
+  // nullptr overload of `|` returns null whether or not the key is present.
+  const char* authorized = doc["authorized"].as<const char*>();
   if (authorized && std::strcmp(authorized, "OK") != 0) {
     LOG_ERR("BookOrbit", "Auth response explicitly denied authorization");
     return BookOrbitSyncClient::INVALID_AUTH_RESPONSE;

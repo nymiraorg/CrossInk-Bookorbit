@@ -32,6 +32,9 @@ class BookOrbitCredentialStore : public PersistableStore<BookOrbitCredentialStor
   std::string downloadFolder;  // catalog download folder, normalized ("" = SD root)
   BookOrbitSyncBehavior syncBehavior = BookOrbitSyncBehavior::ASK_EVERY_TIME;
   bool syncOnSleep = false;
+  bool autoDeliveryOnSleep = false;
+  std::string deliveryScopeId;    // numeric SmartScope id; "" = none configured
+  std::string deliveryScopeName;  // display name, rendered without a network hit
 
   BookOrbitCredentialStore() = default;
   ~BookOrbitCredentialStore() = default;
@@ -77,6 +80,35 @@ class BookOrbitCredentialStore : public PersistableStore<BookOrbitCredentialStor
   bool getSyncOnSleep() const {
     ensureLoaded();
     return syncOnSleep;
+  }
+
+  // "Automatically download new books" during a sleep sync, from the delivery scope.
+  void setAutoDeliveryOnSleep(const bool enabled) {
+    ensureLoaded();
+    autoDeliveryOnSleep = enabled;
+  }
+  bool getAutoDeliveryOnSleep() const {
+    ensureLoaded();
+    return autoDeliveryOnSleep;
+  }
+
+  // The SmartScope sleep delivery pulls from ("" = none configured). A scope id is
+  // not a secret: persisted plaintext like serverUrl and downloadFolder.
+  void setDeliveryScopeId(const std::string& id) {
+    ensureLoaded();
+    deliveryScopeId = id;
+  }
+  const std::string& getDeliveryScopeId() const {
+    ensureLoaded();
+    return deliveryScopeId;
+  }
+  void setDeliveryScopeName(const std::string& name) {
+    ensureLoaded();
+    deliveryScopeName = name;
+  }
+  const std::string& getDeliveryScopeName() const {
+    ensureLoaded();
+    return deliveryScopeName;
   }
 
   // Catalog download folder. Callers must pass a normalized value: "" for the SD

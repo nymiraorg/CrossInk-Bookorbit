@@ -108,7 +108,9 @@ KOReaderSyncClient::Error validateAuthResponse(const char* body) {
     return KOReaderSyncClient::INVALID_AUTH_RESPONSE;
   }
 
-  const char* authorized = doc["authorized"] | nullptr;
+  // .as<const char*>() — NOT `| nullptr`: the nullptr overload of `|` returns
+  // null whether or not the key is present (same trap as BookOrbitSyncClient).
+  const char* authorized = doc["authorized"].as<const char*>();
   if (authorized && std::strcmp(authorized, "OK") != 0) {
     LOG_ERR("KOSync", "Auth response explicitly denied authorization");
     return KOReaderSyncClient::INVALID_AUTH_RESPONSE;

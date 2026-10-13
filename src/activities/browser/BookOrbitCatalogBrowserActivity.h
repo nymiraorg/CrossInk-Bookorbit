@@ -23,10 +23,22 @@
  */
 class BookOrbitCatalogBrowserActivity final : public Activity {
  public:
-  enum class BrowserState { CHECK_WIFI, WIFI_SELECTION, LOADING, BROWSING, DOWNLOADING, ERROR, SEARCH_INPUT };
-  enum class EntryType { SECTION, FACET_SECTION, FACET, LOCAL_SECTION, LOCAL_BOOK, SEARCH, BOOK };
+  enum class BrowserState { CHECK_WIFI, WIFI_SELECTION, LOADING, BROWSING, DOWNLOADING, ERROR, SEARCH_INPUT, REQUEST_INPUT };
+  enum class EntryType {
+    SECTION,
+    FACET_SECTION,
+    FACET,
+    LOCAL_SECTION,
+    LOCAL_BOOK,
+    SEARCH,
+    BOOK,
+    REQUEST,              // root: "Request a book"
+    MY_REQUESTS,           // root: "My requests"
+    REQUEST_CANDIDATE,     // a metadata candidate in the request results list
+    MY_REQUEST             // a row in the "My requests" list
+  };
   // Which listing the BROWSING state currently shows; drives Back navigation.
-  enum class NavLevel { Root, FacetList, Books };
+  enum class NavLevel { Root, FacetList, Books, RequestCandidates, MyRequests };
 
   struct Entry {
     EntryType type;
@@ -63,9 +75,20 @@ class BookOrbitCatalogBrowserActivity final : public Activity {
   bool longPressFired = false;
   std::string errorMessage;
   std::string statusMessage;
+  // v3 request flow: the title/author being requested, and the candidate list
+  // currently shown (navLevel == RequestCandidates) vs "My requests"
+  // (navLevel == MyRequests). Both reuse `entries` + BROWSING rendering.
+  std::string requestTitle;
+  std::string requestAuthor;
+  std::string requestUsername;  // native login username (first-run only)
   size_t downloadProgress = 0;
   size_t downloadTotal = 0;
   bool goHomeAfterCancel = false;
+  bool downloadCancelRequested = false;
+  // One catalog download runs at a time on the main task; the static pointer lets the
+  // non-capturing CancelCheck (bool (*)()) poll this instance's input.
+  static BookOrbitCatalogBrowserActivity* s_downloadingSelf;
+  static bool downloadCancelPoll();
 
   // Current book-list context, used to page and to return to the same list after a download.
   BookOrbitBookQuery listQuery;
@@ -120,6 +143,13 @@ class BookOrbitCatalogBrowserActivity final : public Activity {
   void restoreBookListAfterDownload();
   void launchSearch();
   void performSearch(const std::string& query);
+  void launchRequest();
+  void promptRequestTitle();
+  void launchNativeLogin();
+  void runRequestSearch(const std::string& title, const std::string& author);
+  void confirmRequestCandidate();
+  void launchMyRequests();
+  void activateMyRequest();
   // replacePath: re-download over that existing on-device file instead of the
   // server's path; the old copy is only swapped out once the new one is complete.
   void downloadBook(int64_t bookId, const std::string& title, const std::string& replacePath = "");

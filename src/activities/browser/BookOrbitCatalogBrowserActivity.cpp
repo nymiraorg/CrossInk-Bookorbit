@@ -16,6 +16,9 @@
 
 #include "./BookOrbitCatalogListCache.h"
 #include "BookOrbitCredentialStore.h"
+#include "BookOrbitRequestClient.h"
+#include "BookOrbitRequestCredentialStore.h"
+#include "BookOrbitDownload.h"
 #include "BookOrbitDownloadIndex.h"
 #include "CrossPointState.h"
 #include "MappedInputManager.h"
@@ -44,7 +47,6 @@ namespace fui = freeink::ui;
 
 namespace {
 constexpr fui::ActionId ACTION_ROW = 1;
-constexpr size_t BOOKORBIT_DOWNLOAD_BUFFER_SIZE = 2048;
 constexpr char READ_FOLDER_PREFIX[] = "/Read";
 constexpr size_t MAX_LOCAL_ENTRIES = 200;
 constexpr int DOWNLOAD_PROGRESS_STEP_PERCENT = 5;
@@ -52,36 +54,9 @@ constexpr unsigned long DOWNLOAD_PROGRESS_MIN_UPDATE_MS = 1000;
 constexpr unsigned long DOWNLOAD_PROGRESS_MAX_UPDATE_MS = 5000;
 // Hold threshold for the book action menu (firmware convention, as in Recent Books).
 constexpr unsigned long LONG_PRESS_MS = 1000;
-// Where HttpDownloader stages a download until it is complete and checked (see
-// DownloadFileSwap). Not ".epub", so a leftover never shows up as a book.
-constexpr char STAGED_DOWNLOAD_SUFFIX[] = ".part";
 // Marker appended (right-aligned) to catalog rows whose book already exists on the
 // device. U+2022 bullet: guaranteed by the built-in fonts' default glyph intervals.
 constexpr char ON_DEVICE_MARKER[] = "\xE2\x80\xA2";
-
-// The SD filename (leading slash, no folder) this firmware falls back to when the
-// server does not say where the file belongs.
-std::string catalogBookFilename(const std::string& title, const std::string& author) {
-  const std::string suffix = author.empty() ? "" : (" - " + author);
-  return "/" + StringUtils::sanitizeFilename(title + suffix) + ".epub";
-}
-
-// Where a catalog file belongs under the download folder, leading slash included.
-// BookOrbit resolves the account's KOReader file naming template (or this device's
-// override) and returns it as the file's devicePath, so a book lands where the same
-// account's KOReader devices put it — series folders and all. Servers that do not
-// send one keep the title-author name this fork always used.
-std::string catalogBookFilename(const BookOrbitBookDetail& detail, const BookOrbitCatalogFile& file) {
-  const std::string fromServer = BookOrbitDevicePath::sanitizeRelativePath(file.devicePath);
-  if (!fromServer.empty()) return "/" + fromServer;
-  return catalogBookFilename(detail.title, detail.author);
-}
-
-// The full SD path a catalog book downloads to: the configured download folder
-// ("" = SD root) plus the filename above.
-std::string catalogBookPath(const BookOrbitBookDetail& detail, const BookOrbitCatalogFile& file) {
-  return BOOKORBIT_STORE.getDownloadFolder() + catalogBookFilename(detail, file);
-}
 
 // True when the catalog book already exists locally, with its path in outPath. The download index knows
 // where past downloads landed, whatever the folder setting or the server's naming
@@ -95,7 +70,7 @@ std::string catalogBookPath(const BookOrbitBookDetail& detail, const BookOrbitCa
 // hand, this stays a best-effort convenience marker.
 bool bookOnDevice(const int64_t bookId, const std::string& title, const std::string& author, std::string& outPath) {
   if (BookOrbitDownloadIndex::lookup(bookId, outPath)) return true;
-  const std::string filename = catalogBookFilename(title, author);
+  const std::string filename = BookOrbitDownload::catalogBookFilename(title, author);
   const std::string& folder = BOOKORBIT_STORE.getDownloadFolder();
   if (!folder.empty() && Storage.exists((folder + filename).c_str())) {
     outPath = folder + filename;
@@ -118,18 +93,29 @@ std::string bookTitleFromPath(const std::string& path) {
   return path.substr(start, end - start);
 }
 
-bool hasEpubFile(const BookOrbitBookDetail& detail, BookOrbitCatalogFile& outFile) {
-  for (const auto& file : detail.files) {
-    std::string format = file.format;
-    std::transform(format.begin(), format.end(), format.begin(), [](unsigned char c) { return std::tolower(c); });
-    if (format == "epub") {
-      outFile = file;
-      return true;
-    }
-  }
-  return false;
-}
 }  // namespace
+
+BookOrbitCatalogBrowserActivity* BookOrbitCatalogBrowserActivity::s_downloadingSelf = nullptr;
+
+// Non-capturing stop-check for BookOrbitDownload::deliver: polls the active catalog
+// activity's input so Back and the Home gesture cancel a download. One download runs
+// at a time on the main task, so the static pointer is unambiguous.
+bool BookOrbitCatalogBrowserActivity::downloadCancelPoll() {
+  BookOrbitCatalogBrowserActivity* self = s_downloadingSelf;
+  if (self == nullptr) return true;  // no download in flight: nothing to cancel
+  if (self->downloadCancelRequested) return true;
+  self->mappedInput.update();
+  if (self->mappedInput.wasHomeGesture()) {
+    self->goHomeAfterCancel = true;
+    self->downloadCancelRequested = true;
+  }
+  if (self->mappedInput.isPressed(MappedInputManager::Button::Back) ||
+      self->mappedInput.wasPressed(MappedInputManager::Button::Back) ||
+      self->mappedInput.wasReleased(MappedInputManager::Button::Back)) {
+    self->downloadCancelRequested = true;
+  }
+  return self->downloadCancelRequested;
+}
 
 BookOrbitCatalogBrowserActivity::BookOrbitCatalogBrowserActivity(GfxRenderer& renderer, MappedInputManager& mappedInput)
     : Activity("BookOrbitCatalogBrowser", renderer, mappedInput),
@@ -296,6 +282,14 @@ bool BookOrbitCatalogBrowserActivity::loadRoot(const bool allowNetwork) {
                      std::to_string(collectLocalBooks("in-progress", nullptr)) + ")";
   inProgress.sectionId = "in-progress";
   entries.push_back(std::move(inProgress));
+  Entry requestBook;
+  requestBook.type = EntryType::REQUEST;
+  requestBook.title = "Request a book";
+  entries.push_back(std::move(requestBook));
+  Entry myRequests;
+  myRequests.type = EntryType::MY_REQUESTS;
+  myRequests.title = "My requests";
+  entries.push_back(std::move(myRequests));
   Entry search;
   search.type = EntryType::SEARCH;
   search.title = tr(STR_SEARCH);
@@ -605,6 +599,203 @@ void BookOrbitCatalogBrowserActivity::performSearch(const std::string& query) {
   }
 }
 
+void BookOrbitCatalogBrowserActivity::launchRequest() {
+  if (!BOOKORBIT_REQUEST_STORE.hasRefreshToken()) {
+    // First use: native login before any request/metadata call.
+    launchNativeLogin();
+    return;
+  }
+  promptRequestTitle();
+}
+
+void BookOrbitCatalogBrowserActivity::promptRequestTitle() {
+  consumeConfirm = true;
+  state = BrowserState::REQUEST_INPUT;
+  requestUpdate();
+
+  auto keyboard = std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, "Title");
+  startActivityForResult(std::move(keyboard), [this](const ActivityResult& result) {
+    state = BrowserState::BROWSING;
+    if (!result.isCancelled) {
+      requestTitle = std::get<KeyboardResult>(result.data).text;
+      requestAuthor.clear();
+      runRequestSearch(requestTitle, requestAuthor);
+    } else {
+      requestUpdate();
+    }
+  });
+}
+
+void BookOrbitCatalogBrowserActivity::launchNativeLogin() {
+  // The request account lives on the same BookOrbit server as the sync
+  // credentials, so seed the request store's URL from the existing store.
+  BOOKORBIT_REQUEST_STORE.setServerUrl(BOOKORBIT_STORE.getServerUrl());
+
+  consumeConfirm = true;
+  state = BrowserState::REQUEST_INPUT;
+  requestUpdate();
+
+  auto k1 = std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, "BookOrbit username");
+  startActivityForResult(std::move(k1), [this](const ActivityResult& r1) {
+    if (r1.isCancelled) {
+      state = BrowserState::BROWSING;
+      requestUpdate();
+      return;
+    }
+    requestUsername = std::get<KeyboardResult>(r1.data).text;
+
+    auto k2 = std::make_unique<KeyboardEntryActivity>(renderer, mappedInput, "Password", "", 0, InputType::Password);
+    startActivityForResult(std::move(k2), [this](const ActivityResult& r2) {
+      if (r2.isCancelled) {
+        state = BrowserState::BROWSING;
+        requestUpdate();
+        return;
+      }
+      const std::string password = std::get<KeyboardResult>(r2.data).text;
+      // Free the catalog listing before the network op: the request flow runs
+      // in this activity's heap, and the login JSON + response need contiguous
+      // headroom (same reason downloadBook frees the list).
+      std::vector<Entry>().swap(entries);
+      BookOrbitDownloadIndex::unload();
+      const BookOrbitRequestClient::Error err = BookOrbitRequestClient::loginNative(requestUsername, password);
+      if (err != BookOrbitRequestClient::OK) {
+        state = BrowserState::ERROR;
+        switch (err) {
+          case BookOrbitRequestClient::AUTH_FAILED:
+            errorMessage = "Login failed — wrong username/password";
+            break;
+          case BookOrbitRequestClient::JSON_ERROR:
+            errorMessage = "Login response unreadable: " + BookOrbitRequestClient::lastLoginDiagnostic();
+            break;
+          case BookOrbitRequestClient::SERVER_ERROR:
+            errorMessage = "BookOrbit server error";
+            break;
+          default:
+            errorMessage = "Could not reach BookOrbit";
+            break;
+        }
+        requestUpdate();
+        return;
+      }
+      promptRequestTitle();
+    });
+  });
+}
+
+void BookOrbitCatalogBrowserActivity::runRequestSearch(const std::string& title, const std::string& author) {
+  if (title.empty()) {
+    state = BrowserState::BROWSING;
+    requestUpdate();
+    return;
+  }
+
+  std::vector<Entry>().swap(entries);
+  BookOrbitDownloadIndex::unload();
+  showLoadingBeforeFetch();
+  std::vector<Entry> candidates;
+  const BookOrbitRequestClient::Error err = BookOrbitRequestClient::searchMetadata(
+      title, author, [&candidates](const JsonDocument& candidate) {
+        Entry entry;
+        entry.type = EntryType::REQUEST_CANDIDATE;
+        entry.title = candidate["title"] | "(untitled)";
+        entry.subtitle = candidate["authors"][0] | "";
+        entry.sectionId = candidate["providerId"] | "";
+        candidates.push_back(std::move(entry));
+        return candidates.size() < 20;
+      });
+
+  if (err != BookOrbitRequestClient::OK || candidates.empty()) {
+    state = BrowserState::ERROR;
+    errorMessage = (err == BookOrbitRequestClient::AUTH_FAILED) ? "Request account needs authentication" : "No results";
+    requestUpdate();
+    return;
+  }
+
+  entries = std::move(candidates);
+  navLevel = NavLevel::RequestCandidates;
+  selectorIndex = 0;
+  state = BrowserState::BROWSING;
+  requestUpdate();
+}
+
+void BookOrbitCatalogBrowserActivity::confirmRequestCandidate() {
+  if (entries.empty() || selectorIndex >= entries.size()) return;
+  const Entry& entry = entries[selectorIndex];
+  if (entry.type != EntryType::REQUEST_CANDIDATE) return;
+
+  JsonDocument payload;
+  payload["title"] = entry.title;
+  if (!entry.subtitle.empty()) payload["authors"][0] = entry.subtitle;
+  payload["mediaKind"] = "ebook";
+  payload["preferredFormats"][0] = "epub";
+  payload["targetLibraryId"] = 1;
+
+  int32_t requestId = 0;
+  std::vector<Entry>().swap(entries);
+  BookOrbitDownloadIndex::unload();
+  const BookOrbitRequestClient::Error err = BookOrbitRequestClient::submitRequest(payload, requestId);
+  if (err != BookOrbitRequestClient::OK) {
+    state = BrowserState::ERROR;
+    errorMessage = (err == BookOrbitRequestClient::AUTH_FAILED) ? "Request account needs authentication" : "Request failed";
+    requestUpdate();
+    return;
+  }
+
+  requestTitle.clear();
+  requestAuthor.clear();
+  if (!loadRoot(/*allowNetwork=*/false)) {
+    showLoadingBeforeFetch();
+    loadRoot();
+  }
+}
+
+void BookOrbitCatalogBrowserActivity::launchMyRequests() {
+  std::vector<Entry>().swap(entries);
+  BookOrbitDownloadIndex::unload();
+  showLoadingBeforeFetch();
+  JsonDocument doc;
+  const BookOrbitRequestClient::Error err = BookOrbitRequestClient::fetchMyRequests(doc);
+  if (err != BookOrbitRequestClient::OK) {
+    state = BrowserState::ERROR;
+    errorMessage = (err == BookOrbitRequestClient::AUTH_FAILED) ? "Request account needs authentication" : "Could not load requests";
+    requestUpdate();
+    return;
+  }
+
+  std::vector<Entry> rows;
+  const JsonArrayConst items = doc["items"].as<JsonArrayConst>();
+  for (const JsonVariantConst item : items) {
+    Entry entry;
+    entry.type = EntryType::MY_REQUEST;
+    entry.title = item["title"] | "(untitled)";
+    entry.subtitle = item["status"] | "";
+    entry.bookId = item["matchedBookId"] | 0;
+    rows.push_back(std::move(entry));
+  }
+
+  entries = std::move(rows);
+  navLevel = NavLevel::MyRequests;
+  selectorIndex = 0;
+  state = entries.empty() ? BrowserState::ERROR : BrowserState::BROWSING;
+  if (entries.empty()) errorMessage = "No requests yet";
+  requestUpdate();
+}
+
+void BookOrbitCatalogBrowserActivity::activateMyRequest() {
+  if (entries.empty() || selectorIndex >= entries.size()) return;
+  const Entry& entry = entries[selectorIndex];
+  if (entry.type != EntryType::MY_REQUEST) return;
+
+  if (entry.bookId <= 0) return;  // not available yet
+
+  std::string path;
+  if (BookOrbitDownloadIndex::lookup(entry.bookId, path)) {
+    openLocalBook(path);
+  } else {
+    downloadBook(entry.bookId, entry.title);
+  }
+}
+
 void BookOrbitCatalogBrowserActivity::downloadBook(const int64_t bookId, const std::string& title,
                                                    const std::string& replacePath) {
   state = BrowserState::DOWNLOADING;
@@ -613,165 +804,90 @@ void BookOrbitCatalogBrowserActivity::downloadBook(const int64_t bookId, const s
   // own tight budget mid-download (see HttpDownloader heap notes).
   statusMessage = renderer.truncatedText(UI_10_FONT_ID, title.c_str(), renderer.getScreenWidth() - 40);
   downloadProgress = downloadTotal = 0;
+  downloadCancelRequested = false;
   goHomeAfterCancel = false;
   requestUpdate(true);
-
-  BookOrbitBookDetail detail;
-  if (!BookOrbitCatalogClient::fetchBookDetail(bookId, detail)) {
-    state = BrowserState::ERROR;
-    errorMessage = BookOrbitCatalogClient::lastFetchBadResponse ? tr(STR_BOOKORBIT_CATALOG_BAD_RESPONSE)
-                                                                : tr(STR_BOOKORBIT_CATALOG_ERROR);
-    requestUpdate();
-    return;
-  }
-
-  BookOrbitCatalogFile epubFile;
-  if (!hasEpubFile(detail, epubFile)) {
-    state = BrowserState::ERROR;
-    errorMessage = tr(STR_NO_EPUB_FORMAT);
-    requestUpdate();
-    return;
-  }
-
-  // A re-download keeps the book where it is: its reading progress and caches are
-  // keyed by that path. Either way the transfer is staged in a side file and only
-  // swapped in once it is complete and opens as an EPUB (see downloadOptions below),
-  // so a failure or a cancel never costs the user the copy they had, and a new book
-  // never sits half-written under its own name.
-  const std::string finalPath = replacePath.empty() ? catalogBookPath(detail, epubFile) : replacePath;
-  // Create the download folder and, when the server's naming template nests the book
-  // ("Sprawl/<book>.epub"), every folder it asks for. mkdir's pFlag creates the
-  // missing parents in one call, so this covers both at once.
-  const size_t lastSlash = finalPath.find_last_of('/');
-  if (lastSlash > 0 && lastSlash != std::string::npos) {
-    const std::string folder = finalPath.substr(0, lastSlash);
-    if (!Storage.exists(folder.c_str()) && !Storage.mkdir(folder.c_str())) {
-      LOG_ERR("BookOrbit", "Could not create download folder %s", folder.c_str());
-      state = BrowserState::ERROR;
-      errorMessage = tr(STR_DOWNLOAD_FAILED);
-      requestUpdate();
-      return;
-    }
-  }
-
-  LOG_DBG("BookOrbit", "Downloading file %lld -> %s", static_cast<long long>(epubFile.id), finalPath.c_str());
-
-  bool cancelRequested = false;
-  auto pollCancel = [this, &cancelRequested] {
-    if (cancelRequested) return true;
-    mappedInput.update();
-    if (mappedInput.wasHomeGesture()) {
-      goHomeAfterCancel = true;
-      cancelRequested = true;
-    }
-    if (mappedInput.isPressed(MappedInputManager::Button::Back) ||
-        mappedInput.wasPressed(MappedInputManager::Button::Back) ||
-        mappedInput.wasReleased(MappedInputManager::Button::Back)) {
-      cancelRequested = true;
-    }
-    return cancelRequested;
-  };
-
-  HttpDownloader::DownloadOptions downloadOptions;
-  downloadOptions.shouldCancel = pollCancel;
-  downloadOptions.bufferSize = BOOKORBIT_DOWNLOAD_BUFFER_SIZE;
-  // TLS runs with a few KB of headroom on the C3 and reads can drop mid-transfer;
-  // keep the partial file and resume instead of restarting a multi-MB download.
-  downloadOptions.preservePartial = true;
-  // Small client RX buffer (see BookOrbitCatalogClient::fetchJson) so the
-  // headers-time body cache can't demand a large realloc next to the TLS buffers.
-  downloadOptions.clientRxBufferSize = 2048;
-  // CrossInk v1.6.1's download safeguards, as its OPDS browser uses them: stage the file
-  // as "<book>.part", refuse a book the card cannot hold before writing any of it, and
-  // only put the file in place once it opens as an EPUB. A body cut short without a
-  // Content-Length, or an error page served as the file, used to land as the book.
-  downloadOptions.stageAsPart = true;
-  downloadOptions.checkFreeSpace = true;
-  downloadOptions.validate = [](const std::string& path) {
-    ZipFile zip(path);
-    size_t size = 0;
-    return zip.getInflatedFileSize("META-INF/container.xml", &size) && size > 0;
-  };
 
   // Free the current listing while the download runs: every KB of contiguous heap
   // matters next to the TLS session, and the list is rebuilt from listQuery after.
   std::vector<Entry>().swap(entries);
   listFreedForDownload = true;
 
-  constexpr int MAX_DOWNLOAD_ATTEMPTS = 3;
-  HttpDownloader::DownloadError result = HttpDownloader::HTTP_ERROR;
   int lastRenderedPercent = -1;
   unsigned long lastProgressUpdateMs = 0;
   unsigned long now = 0;
   int percent = 0;
-  for (int attempt = 0; attempt < MAX_DOWNLOAD_ATTEMPTS; attempt++) {
-    // Honor a Back press between attempts too: a failing download otherwise runs
-    // all its retries (TLS handshake included) with the cancel request ignored.
-    if (pollCancel()) {
-      result = HttpDownloader::ABORTED;
-      break;
+  auto progress = [this, &lastRenderedPercent, &lastProgressUpdateMs, &percent, &now](const size_t downloaded,
+                                                                                      const size_t total) {
+    downloadProgress = downloaded;
+    downloadTotal = total;
+    percent = total > 0 ? static_cast<int>(static_cast<uint64_t>(downloaded) * 100 / total) : 0;
+    now = millis();
+    // Throttle e-ink refreshes to meaningful progress steps: partial refreshes still
+    // wear the panel, and a raw byte-count callback fires far more often than the
+    // screen needs to redraw.
+    if (percent >= 100 || lastRenderedPercent < 0 ||
+        (percent >= lastRenderedPercent + DOWNLOAD_PROGRESS_STEP_PERCENT &&
+         now > DOWNLOAD_PROGRESS_MIN_UPDATE_MS) ||
+        now - lastProgressUpdateMs > DOWNLOAD_PROGRESS_MAX_UPDATE_MS) {
+      lastRenderedPercent = percent;
+      lastProgressUpdateMs = now;
+      requestUpdate(true);
     }
-    downloadOptions.resumePartial = attempt > 0;
-    result = BookOrbitCatalogClient::downloadFile(
-        epubFile.id, finalPath,
-        [this, &lastRenderedPercent, &lastProgressUpdateMs, &percent, &now](const size_t downloaded,
-                                                                            const size_t total) {
-          downloadProgress = downloaded;
-          downloadTotal = total;
-          percent = total > 0 ? static_cast<int>(static_cast<uint64_t>(downloaded) * 100 / total) : 0;
-          now = millis();
-          // Throttle e-ink refreshes to meaningful progress steps: partial
-          // refreshes still wear the panel, and a raw byte-count callback fires
-          // far more often than the screen needs to redraw.
-          if (percent >= 100 || lastRenderedPercent < 0 ||
-              (percent >= lastRenderedPercent + DOWNLOAD_PROGRESS_STEP_PERCENT &&
-               now > DOWNLOAD_PROGRESS_MIN_UPDATE_MS) ||
-              now - lastProgressUpdateMs > DOWNLOAD_PROGRESS_MAX_UPDATE_MS) {
-            lastRenderedPercent = percent;
-            lastProgressUpdateMs = now;
-            requestUpdate(true);
-          }
-        },
-        &cancelRequested, downloadOptions);
-    // A full card will not have more room on the next attempt.
-    if (result == HttpDownloader::OK || result == HttpDownloader::ABORTED ||
-        result == HttpDownloader::INSUFFICIENT_SPACE) {
-      break;
-    }
-    LOG_ERR("BookOrbit", "Download attempt %d/%d failed (err=%d), retrying", attempt + 1, MAX_DOWNLOAD_ATTEMPTS,
-            static_cast<int>(result));
-  }
+  };
 
-  const bool downloadFailed = result != HttpDownloader::OK && result != HttpDownloader::ABORTED;
-  if (downloadFailed) {
-    // preservePartial kept the staged file for resuming between attempts; don't
-    // leave it behind once we give up.
-    Storage.remove((finalPath + STAGED_DOWNLOAD_SUFFIX).c_str());
-  }
+  // One catalog download runs at a time; the transfer itself lives in BookOrbitDownload.
+  s_downloadingSelf = this;
+  const BookOrbitDownload::Outcome outcome =
+      replacePath.empty()
+          ? BookOrbitDownload::deliver(bookId, progress, &BookOrbitCatalogBrowserActivity::downloadCancelPoll)
+          : BookOrbitDownload::deliverOver(bookId, replacePath, progress,
+                                           &BookOrbitCatalogBrowserActivity::downloadCancelPoll);
+  s_downloadingSelf = nullptr;
 
-  if (result == HttpDownloader::OK) {
-    clearBookCache(finalPath);
-    BookOrbitDownloadIndex::record(bookId, finalPath);
-    // A new book, or new contents under a known path: the Library's index is stale.
-    library::invalidateLibraryIndex();
-  } else if (result == HttpDownloader::ABORTED) {
-    LOG_DBG("BookOrbit", "Download cancelled");
-    if (goHomeAfterCancel) {
-      onGoHome();
-      return;
-    }
-    mappedInput.suppressNextBackRelease();
-  } else {
-    LOG_ERR("BookOrbit", "Download failed (err=%d)", static_cast<int>(result));
-    errorMessage = result == HttpDownloader::INSUFFICIENT_SPACE ? tr(STR_SD_CARD_FULL) : tr(STR_DOWNLOAD_FAILED);
+  bool failed = false;
+  switch (outcome) {
+    case BookOrbitDownload::Outcome::DOWNLOADED:
+    case BookOrbitDownload::Outcome::ALREADY_LOCAL:
+      break;
+    case BookOrbitDownload::Outcome::CONFLICT:
+      failed = true;
+      errorMessage = tr(STR_BOOKORBIT_DOWNLOAD_CONFLICT);
+      break;
+    case BookOrbitDownload::Outcome::FAILED:
+      failed = true;
+      switch (BookOrbitDownload::lastFailureKind) {
+        case BookOrbitDownload::FailureKind::FETCH:
+          errorMessage = BookOrbitCatalogClient::lastFetchBadResponse ? tr(STR_BOOKORBIT_CATALOG_BAD_RESPONSE)
+                                                                      : tr(STR_BOOKORBIT_CATALOG_ERROR);
+          break;
+        case BookOrbitDownload::FailureKind::NO_EPUB:
+          errorMessage = tr(STR_NO_EPUB_FORMAT);
+          break;
+        case BookOrbitDownload::FailureKind::DOWNLOAD:
+        default:
+          errorMessage = BookOrbitDownload::lastError == HttpDownloader::INSUFFICIENT_SPACE
+                             ? tr(STR_SD_CARD_FULL)
+                             : tr(STR_DOWNLOAD_FAILED);
+          break;
+      }
+      break;
+    case BookOrbitDownload::Outcome::ABORTED:
+      LOG_DBG("BookOrbit", "Download cancelled");
+      if (goHomeAfterCancel) {
+        onGoHome();
+        return;
+      }
+      mappedInput.suppressNextBackRelease();
+      break;
   }
 
   // The listing was freed for download headroom; rebuild it from the stored
   // context so the user returns to the same page, on the same book.
   restoreBookListAfterDownload();
 
-  // The rebuild leaves BROWSING state behind, which would swallow the failure
-  if (downloadFailed) {
+  // The rebuild leaves BROWSING state behind, which would swallow the failure.
+  if (failed) {
     state = BrowserState::ERROR;
   }
 
@@ -850,6 +966,18 @@ void BookOrbitCatalogBrowserActivity::activateSelected() {
     }
     case EntryType::SEARCH:
       launchSearch();
+      break;
+    case EntryType::REQUEST:
+      launchRequest();
+      break;
+    case EntryType::MY_REQUESTS:
+      launchMyRequests();
+      break;
+    case EntryType::REQUEST_CANDIDATE:
+      confirmRequestCandidate();
+      break;
+    case EntryType::MY_REQUEST:
+      activateMyRequest();
       break;
     case EntryType::BOOK:
       if (entry.onDevice) {

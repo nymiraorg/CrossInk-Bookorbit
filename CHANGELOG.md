@@ -5,6 +5,14 @@ records only its own additions. Each release states the CrossInk version it is b
 on; for everything inherited from upstream, see the
 [CrossInk changelog](https://github.com/uxjulia/CrossInk/blob/main/CHANGELOG.md).
 
+## [Unreleased]
+
+Based on CrossInk v1.6.1.
+
+### Added
+
+- Automatic Local Book Delivery: a new "Automatically download new books" setting (Off / On sleep) makes the sleep sync download new books in the configured BookOrbit delivery SmartScope straight into the native Library, without browsing the cloud catalog. A "Download pending books now" action runs the same delivery on demand with visible progress, and the scope is chosen from a picker rather than typed.
+
 ## [v1.6.1+bookorbit.1] - 2026-10-05
 
 Based on CrossInk v1.6.1.

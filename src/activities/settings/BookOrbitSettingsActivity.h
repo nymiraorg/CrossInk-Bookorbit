@@ -4,6 +4,7 @@
 #include <FreeInkUIGfxRenderer.h>
 
 #include <atomic>
+#include <string>
 
 #include "activities/Activity.h"
 #include "util/ButtonNavigator.h"
@@ -46,4 +47,19 @@ class BookOrbitSettingsActivity final : public Activity {
   void buildListScreen(UiApp::ScreenType& screen);
 
   void handleSelection();
+
+  // Transient state for the foreground "Delivery scope" and "Download pending books
+  // now" actions: a short status shown as the last row's value, plus download progress.
+  std::string deliveryStatus;
+  size_t deliveryProgress = 0;
+  size_t deliveryTotal = 0;
+  bool deliveryRunning = false;
+  bool deliveryCancelRequested = false;
+  // One foreground delivery runs at a time on the main task; the static pointer lets
+  // the non-capturing CancelCheck (bool (*)()) poll this instance's input.
+  static BookOrbitSettingsActivity* s_deliveringSelf;
+  static bool deliveryCancelPoll();
+
+  void openDeliveryScopePicker();
+  void runDownloadPendingNow();
 };

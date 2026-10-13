@@ -23,6 +23,7 @@
 #include "BookOrbitAnnotationStore.h"
 #include "BookOrbitBookmarkStore.h"
 #include "BookOrbitCredentialStore.h"
+#include "BookOrbitDeliverySync.h"
 #include "BookOrbitStatsQueue.h"
 #include "BookmarkStore.h"
 #include "ClippingStore.h"
@@ -332,13 +333,26 @@ void BookOrbitSyncActivity::runSleepSync() {
   LOG_INF("BookOrbit", "Sleep sync starting (free=%u maxAlloc=%u)", ESP.getFreeHeap(), ESP.getMaxAllocHeap());
   sdFontSystem.releaseLoadedFont(renderer);
   wifiActivated = true;
-  if (SavedWifiConnect::connect(&sleepSyncWakeRequested)) {
+  const bool connected = SavedWifiConnect::connect(&sleepSyncWakeRequested);
+  if (connected) {
     // The whole sync runs synchronously from here, decisions included.
     onWifiSelectionComplete(true);
   } else if (!stopIfWoken()) {
     LOG_INF("BookOrbit", "Sleep sync skipped: no saved network answered");
   }
+  // Free the state-sync TLS session BEFORE delivery opens its own catalog TLS
+  // connection: the two memory footprints must never coexist on this hardware.
   syncSession.reset();
+
+  // Auto-delivery rides the same Wi-Fi/cancel/power lifecycle but is a separate step
+  // with its own accounting: a delivery failure never reports the ordinary
+  // progress/highlight/bookmark sync as failed.
+  if (connected && !stopIfWoken() && BOOKORBIT_STORE.getAutoDeliveryOnSleep()) {
+    const BookOrbitDeliverySync::Result r =
+        BookOrbitDeliverySync::fetchMissingBooks(/*progress=*/nullptr, /*shouldCancel=*/sleepSyncWakeRequested);
+    (void)r;
+  }
+
   wifiOff();
   LOG_INF("BookOrbit", "Sleep sync over (state=%d)", static_cast<int>(state));
 #ifdef SIMULATOR
