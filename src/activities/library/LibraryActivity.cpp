@@ -104,7 +104,7 @@ void LibraryActivity::onEnter() {
     seriesScratch.reserve(128);
     genreScratch.reserve(128);
     subtitleScratch.reserve(448);
-    sort = SETTINGS.librarySortMethod <= static_cast<uint8_t>(Sort::Genre)
+    sort = SETTINGS.librarySortMethod <= static_cast<uint8_t>(Sort::InProgress)
                ? static_cast<Sort>(SETTINGS.librarySortMethod)
                : Sort::RecentlyRead;
     descending = SETTINGS.librarySortDescending != 0;
@@ -322,6 +322,8 @@ library::SortOrder LibraryActivity::indexOrder() const {
       return descending ? library::SortOrder::GenreDesc : library::SortOrder::GenreAsc;
     case Sort::DateAdded:
       return descending ? library::SortOrder::RecentDesc : library::SortOrder::RecentAsc;
+    case Sort::InProgress:
+      return descending ? library::SortOrder::RecentDesc : library::SortOrder::RecentAsc;
   }
   return library::SortOrder::RecentDesc;
 }
@@ -342,13 +344,15 @@ const char* LibraryActivity::sortLabel() const {
       return tr(STR_LIBRARY_GENRE);
     case Sort::DateAdded:
       return tr(STR_LIBRARY_DATE_ADDED);
+    case Sort::InProgress:
+      return tr(STR_LIBRARY_IN_PROGRESS);
   }
   return tr(STR_LIBRARY_DATE_ADDED);
 }
 
 bool LibraryActivity::hasActiveFilter() const {
   return !query.empty() || !SETTINGS.libraryShowEpub || !SETTINGS.libraryShowXtc || !SETTINGS.libraryShowTxt ||
-         !SETTINGS.libraryShowMarkdown || SETTINGS.libraryHideFinishedBooks;
+         !SETTINGS.libraryShowMarkdown || SETTINGS.libraryHideFinishedBooks || sort == Sort::InProgress;
 }
 
 int LibraryActivity::rowCount() const {
@@ -509,7 +513,7 @@ void LibraryActivity::applyFilter() {
     }
     // Only matching books need their completion state read from the SD card.
     if (!needle.empty() && !library::matchesQuery(folded, needle)) continue;
-    if (SETTINGS.libraryHideFinishedBooks) {
+    if (SETTINGS.libraryHideFinishedBooks || sort == Sort::InProgress) {
       const uint8_t type = library::fileTypeFor(name);
       cachePath.clear();
       if (type == library::FileEpub) {
@@ -607,16 +611,17 @@ void LibraryActivity::openSortPicker(const int selectedIndex) {
                                       StrId::STR_LIBRARY_AUTHOR_FIRST_NAME,
                                       StrId::STR_LIBRARY_RECENTLY_OPENED,
                                       StrId::STR_LIBRARY_SERIES,
-                                      StrId::STR_LIBRARY_GENRE};
+                                      StrId::STR_LIBRARY_GENRE,
+                                      StrId::STR_LIBRARY_IN_PROGRESS};
   const bool buttonOnly = !mappedInput.hasTouchHardware();
   auto onSelect = [this, buttonOnly](const int selected) {
     if (buttonOnly && selected == 0) {
       descending = !descending;
     } else {
       const int method = selected - (buttonOnly ? 1 : 0);
-      if (method < 0 || method > static_cast<int>(Sort::Genre)) return;
+      if (method < 0 || method > static_cast<int>(Sort::InProgress)) return;
       sort = static_cast<Sort>(method);
-      if (!buttonOnly) descending = sort == Sort::DateAdded || sort == Sort::RecentlyRead;
+      if (!buttonOnly) descending = sort == Sort::DateAdded || sort == Sort::RecentlyRead || sort == Sort::InProgress;
     }
     SETTINGS.librarySortMethod = static_cast<uint8_t>(sort);
     SETTINGS.librarySortDescending = descending;
@@ -629,15 +634,16 @@ void LibraryActivity::openSortPicker(const int selectedIndex) {
   if (buttonOnly) {
     const char* options[] = {descending ? "Z-A" : "A-Z", I18N.get(choices[0]), I18N.get(choices[1]),
                              I18N.get(choices[2]),       I18N.get(choices[3]), I18N.get(choices[4]),
-                             I18N.get(choices[5]),       I18N.get(choices[6])};
-    actionPopup.show(tr(STR_LIBRARY_SORT_BY), options, 8, selectedIndex < 0 ? 0 : selectedIndex, std::move(onSelect));
+                             I18N.get(choices[5]),       I18N.get(choices[6]), I18N.get(choices[7])};
+    actionPopup.show(tr(STR_LIBRARY_SORT_BY), options, 9, selectedIndex < 0 ? 0 : selectedIndex, std::move(onSelect));
     actionPopup.setDividerAfterOption(0);
   } else {
-    actionPopup.show(StrId::STR_LIBRARY_SORT_BY, choices, 7, static_cast<int>(sort), std::move(onSelect));
+    actionPopup.show(StrId::STR_LIBRARY_SORT_BY, choices, 8, static_cast<int>(sort), std::move(onSelect));
   }
   if (index.isOpen() && index.header().formatVersion < 4)
-    actionPopup.setDisabledOptions(buttonOnly ? std::vector<bool>{false, false, false, false, false, false, true, true}
-                                              : std::vector<bool>{false, false, false, false, false, true, true});
+    actionPopup.setDisabledOptions(buttonOnly
+                                       ? std::vector<bool>{false, false, false, false, false, false, true, true, false}
+                                       : std::vector<bool>{false, false, false, false, false, true, true, false});
   requestUpdate();
 }
 
@@ -1058,7 +1064,7 @@ void LibraryActivity::provideRow(void* user, const uint16_t row, fui::ListItem& 
         if (self->groupKeyScratch != self->previousGroupKeyScratch) item.sectionHeading = self->groupHeading.c_str();
       }
     }
-  } else if (self->sort != Sort::RecentlyRead) {
+  } else if (self->sort != Sort::RecentlyRead && self->sort != Sort::InProgress) {
     const uint32_t initial = self->groupForRow(row);
     if (row == 0 || initial != self->groupForRow(row - 1)) {
       self->groupHeading.clear();
@@ -1216,7 +1222,9 @@ void LibraryActivity::buildListScreen(UiApp::ScreenType& screen) {
   if (rowCount() == 0) {
     if (!scanFailed && !filterFailed) {
       const char* message = tr(STR_LIBRARY_EMPTY);
-      if (hasActiveFilter())
+      if (sort == Sort::InProgress)
+        message = tr(STR_LIBRARY_IN_PROGRESS_EMPTY);
+      else if (hasActiveFilter())
         message = tr(STR_LIBRARY_NO_RESULTS);
       else if (sort == Sort::RecentlyRead)
         message = tr(STR_NO_RECENT_BOOKS);

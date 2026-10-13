@@ -28,8 +28,6 @@ class BookOrbitCatalogBrowserActivity final : public Activity {
     SECTION,
     FACET_SECTION,
     FACET,
-    LOCAL_SECTION,
-    LOCAL_BOOK,
     SEARCH,
     BOOK,
     REQUEST,              // root: "Request a book"
@@ -43,10 +41,10 @@ class BookOrbitCatalogBrowserActivity final : public Activity {
   struct Entry {
     EntryType type;
     std::string title;
-    std::string subtitle;   // author, for BOOK/LOCAL_BOOK entries
-    std::string sectionId;  // section id (SECTION/FACET_SECTION/LOCAL_SECTION) or facet entry id (FACET)
+    std::string subtitle;   // author, for BOOK entries
+    std::string sectionId;  // section id (SECTION/FACET_SECTION) or facet entry id (FACET)
     std::string seriesId;   // numeric series id, for FACET entries of the series facet
-    std::string path;       // SD path: LOCAL_BOOK entries, and BOOK entries already on the device
+    std::string path;       // SD path: BOOK entries already on the device
     int64_t bookId = 0;
     bool onDevice = false;  // BOOK entries: a matching file already exists on the device (at `path`)
   };
@@ -133,8 +131,6 @@ class BookOrbitCatalogBrowserActivity final : public Activity {
   void onWifiSelectionComplete(bool connected);
   void showLoadingBeforeFetch();
   bool loadRoot(bool allowNetwork = true);
-  void loadLocalBooks(const std::string& kind);
-  size_t collectLocalBooks(const std::string& kind, std::vector<Entry>* sink);
   bool loadFacetEntries(const std::string& sectionId, const std::string& title, int page, bool append = false,
                         bool allowNetwork = true);
   bool loadBooks(const BookOrbitBookQuery& query, const std::string& title, int page, bool fromFacet,

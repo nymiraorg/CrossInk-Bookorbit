@@ -699,7 +699,7 @@ bool CrossPointSettings::fromJson(JsonVariantConst doc, bool importingCrossPoint
     }
     choice = static_cast<uint8_t>(stored);
   };
-  readLibraryChoice("librarySortMethod", librarySortMethod, 7);
+  readLibraryChoice("librarySortMethod", librarySortMethod, 8);
   readLibraryChoice("librarySortDescending", librarySortDescending, 2);
   readLibraryChoice("libraryListExpanded", libraryListExpanded, 2);
   // A missing or corrupt legacy choice uses List, even if this object loaded another document earlier.

@@ -39,7 +39,7 @@ class LibraryActivity final : public Activity {
 #endif
 
  private:
-  enum class Sort : uint8_t { DateAdded, Title, AuthorLast, AuthorFirst, RecentlyRead, Series, Genre };
+  enum class Sort : uint8_t { DateAdded, Title, AuthorLast, AuthorFirst, RecentlyRead, Series, Genre, InProgress };
   // Touch header controls precede the book rows; button-only navigation visits books directly.
   static constexpr int CONTROL_COUNT = 5;
   using UiApp = freeink::ui::FreeInkApp<32, 4>;
